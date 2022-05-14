@@ -5,7 +5,7 @@ import shutil
 import time
 import warnings
 from enum import Enum
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -19,13 +19,17 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.tensorboard import SummaryWriter
 
+
+
+writer = SummaryWriter("D:\Python_Homework2/tensor2")
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
+parser = argparse.ArgumentParser(description='PyTorch Tiny-ImageNet Training')
+parser.add_argument('data', metavar='DIR', default='D:\Python_Homework2/tiny-imagenet-200/tiny-imagenet-200',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
@@ -34,7 +38,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=2, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -78,7 +82,6 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 
 best_acc1 = 0
 
-
 def main():
     args = parser.parse_args()
 
@@ -117,7 +120,6 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
-
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
@@ -134,9 +136,11 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
+        model.fc = nn.Linear(512,200)
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+        model.fc= nn.Linear(512,200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -168,6 +172,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.cuda()
         else:
             model = torch.nn.DataParallel(model).cuda()
+
 
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
@@ -204,6 +209,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
+
+
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
@@ -213,48 +220,38 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
 
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
-
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True)
 
+
+
+    val_datasets = ImageFolderWithPaths(valdir, transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ]))
+    val_loader = torch.utils.data.DataLoader(
+        val_datasets,
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+    
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader,train_dataset.class_to_idx, model, criterion,args.start_epoch, args)
         return
 
+    
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
-
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-        
+        acc1 = validate(val_loader,train_dataset.class_to_idx, model, criterion, args, epoch)
         scheduler.step()
 
-        
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -298,12 +295,18 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # compute output
         output = model(images)
         loss = criterion(output, target)
-
+        
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
+        if i % 20 == 0:
+            j = i / 20
+            writer.add_scalar('Loss/train',losses.avg, epoch*20+j)
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
+        if i % 20 == 0:
+            j = i/20
+            writer.add_scalar('Acc/train',top5.avg, epoch*20+j)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -318,7 +321,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, class_to_idx, model, criterion, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -333,22 +336,36 @@ def validate(val_loader, model, criterion, args):
 
     with torch.no_grad():
         end = time.time()
-        for i, (images, target) in enumerate(val_loader):
+        if args.evaluate:
+            resul = torch.zeros(args.batch_size, 5)
+        for i, (images, target, paths ) in enumerate(val_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             if torch.cuda.is_available():
                 target = target.cuda(args.gpu, non_blocking=True)
 
+            
+            for j in range(len(paths)):
+                target[j] = new_target(paths[j], class_to_idx)
+            
             # compute output
             output = model(images)
             loss = criterion(output, target)
-
             # measure accuracy and record loss
+            if args.evaluate:
+                _, pred = output.topk(5, 1, True, True)
+            if i == 0:
+                resul = pred
+            else:
+                resul = torch.cat([resul,pred])
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
 
+            if len(paths) < args.batch_size:
+                writer.add_scalar('Loss/Val',losses.avg,epoch )
+                writer.add_scalar('Acc/Val',top5.avg,epoch)
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -357,8 +374,27 @@ def validate(val_loader, model, criterion, args):
                 progress.display(i)
 
         progress.display_summary()
-
+        print(resul)
+        torch.save(resul, 'result_%d.pt'%args.start_epoch)
     return top1.avg
+
+
+import openpyxl
+workbook = openpyxl.load_workbook('D:/Python_Homework2/tiny-imagenet-200/tiny-imagenet-200/val/1.xlsx')
+sheet = workbook['Sheet1']
+Dic_class={}
+for i in range(sheet.max_row):
+    fname = sheet.cell(row=i+1, column=1).value
+    classe = sheet.cell(row=i+1, column=2).value
+    Dic_class[fname] = classe
+
+def new_target(path,class_to_idx):
+  idx = -1
+  while path[idx] != "\\":
+      idx -= 1
+  fname=path[idx+1:]
+  class_1 = Dic_class[fname]
+  return class_to_idx[class_1]
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -450,5 +486,20 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 
+class ImageFolderWithPaths(datasets.ImageFolder):
+    """Custom dataset that includes image file paths. Extends
+    torchvision.datasets.ImageFolder
+    """
+    # override the __getitem__ method. this is the method that dataloader calls
+    def __getitem__(self, index):
+        # this is what ImageFolder normally returns 
+        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
+        # the image file path
+        path = self.imgs[index][0]
+        # make a new tuple that includes original and the path
+        tuple_with_path = (original_tuple + (path,))
+        return tuple_with_path
+
 if __name__ == '__main__':
     main()
+
